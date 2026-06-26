@@ -98,8 +98,8 @@ TEST:
   MULTI_MODAL_VISION:
     DEFAULT: True
   MULTI_MODAL_LANGUAGE:
-    DEFAULT: False
+    DEFAULT: True
   USE_NLP:
-    DEFAULT: False
+    DEFAULT: True
     TNL2K: True
 
