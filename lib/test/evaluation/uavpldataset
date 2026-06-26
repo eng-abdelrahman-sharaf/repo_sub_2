@@ -1,0 +1,198 @@
+import os
+import json
+
+import cv2
+import numpy as np
+
+from lib.test.evaluation.data import Sequence, BaseDataset, SequenceList
+
+
+def _safe_mkdir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+def _decode_video_to_cache(video_path: str, cache_dir: str, expected_n_frames: int | None = None):
+    """
+    Decode an mp4 into cache_dir as 00000000.jpg, 00000001.jpg, ...
+    Correctness-first caching:
+      - If expected_n_frames is provided: reuse cache only if the number of cached jpg frames matches expected_n_frames.
+        Otherwise, clear cache_dir and re-decode.
+      - If expected_n_frames is None: reuse cache if any jpg frames exist.
+    """
+    _safe_mkdir(cache_dir)
+
+    existing = sorted([f for f in os.listdir(cache_dir) if f.endswith(".jpg")])
+
+    # Reuse cache if it looks complete/correct
+    if expected_n_frames is None:
+        if len(existing) > 0:
+            return
+    else:
+        if len(existing) == expected_n_frames:
+            return
+
+        # Cache exists but is incomplete/incorrect -> rebuild it
+        for f in existing:
+            os.remove(os.path.join(cache_dir, f))
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+
+    idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        out_path = os.path.join(cache_dir, f"{idx:08d}.jpg")
+        if not cv2.imwrite(out_path, frame):
+            cap.release()
+            raise RuntimeError(f"Failed to write frame: {out_path}")
+        idx += 1
+
+    cap.release()
+
+    if expected_n_frames is not None and idx != expected_n_frames:
+        raise RuntimeError(
+            f"Decoded frame count mismatch for {video_path}. Decoded={idx}, expected={expected_n_frames}."
+        )
+
+
+def _load_annotations_csv_xywh(annotation_file: str, n_frames: int) -> np.ndarray:
+    """
+    Loads annotation.txt with lines: x,y,w,h.
+    Returns gt with shape (n_frames, 4). If file has fewer rows, pad with zeros.
+    """
+    gt = np.zeros((n_frames, 4), dtype=np.float64)
+
+    if not annotation_file or not os.path.isfile(annotation_file):
+        return gt
+
+    # Robust CSV loading
+    data = np.loadtxt(annotation_file, delimiter=",", dtype=np.float64)
+    if data.ndim == 1:
+        data = data.reshape(1, 4)
+
+    m = min(n_frames, data.shape[0])
+    gt[:m, :] = data[:m, :]
+
+    return gt
+
+
+def _first_valid_bbox(gt: np.ndarray) -> np.ndarray | None:
+    """Return first bbox with w>0 and h>0; otherwise None."""
+    if gt is None or len(gt) == 0:
+        return None
+    valid = np.where((gt[:, 2] > 0) & (gt[:, 3] > 0))[0]
+    if len(valid) == 0:
+        return None
+    return gt[int(valid[0])]
+
+
+def _default_init_bbox_from_first_frame(first_frame_path: str) -> np.ndarray:
+    """
+    Fallback init bbox when no annotations are available.
+    Center box covering 50% of image size (x,y,w,h).
+    """
+    im = cv2.imread(first_frame_path)
+    if im is None:
+        # Last-resort fallback; should basically never happen if decoding succeeded.
+        return np.array([1, 1, 10, 10], dtype=np.float64)
+
+    h, w = im.shape[:2]
+    bw = max(10.0, 0.5 * w)
+    bh = max(10.0, 0.5 * h)
+    x = max(0.0, (w - bw) / 2.0)
+    y = max(0.0, (h - bh) / 2.0)
+    return np.array([x, y, bw, bh], dtype=np.float64)
+
+
+class UAVPLDataset(BaseDataset):
+    """
+    UAV competition dataset loader using contestant_manifest.json.
+
+    - Dataset root (videos/annos): /content/drive/MyDrive/my_dataset/
+    - Manifest: /content/drive/MyDrive/my_dataset/metadata/contestant_manifest.json
+    - Split: public_lb or train
+    - Frames are decoded into /tmp/mcitrack_uavpl_cache/<seq_id>/00000000.jpg ...
+    - For testing: sequences are skipped if a result already exists at:
+        test/tracking_results/mcitrack/mcitrack_b224/<seq_id>.txt
+      Example:
+        dataset1/surfer_1_time -> .../dataset1/surfer_1_time.txt
+    """
+
+    def __init__(
+        self,
+        split: str = "public_lb",
+        dataset_root: str = "/content/my_dataset",
+        manifest_path: str = "/content/my_dataset/metadata/contestant_manifest.json",
+        cache_root: str = "/tmp/mcitrack_uavpl_cache",
+    ):
+        super().__init__()
+        self.split = split
+        self.dataset_root = dataset_root
+        self.manifest_path = manifest_path
+        self.cache_root = cache_root
+
+        if not os.path.isfile(self.manifest_path):
+            raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
+
+        with open(self.manifest_path, "r") as f:
+            manifest = json.load(f)
+
+        if self.split not in manifest:
+            raise ValueError(f"Split '{self.split}' not found in manifest. Available: {list(manifest.keys())}")
+
+        self.seq_meta = manifest[self.split]  # key: "datasetX/seq_name"
+
+    def get_sequence_list(self):
+        """
+        Don't include videos in the sequence list for testing if a tracking result already exists on disk.
+        Results layout (provided by user):
+          test/tracking_results/mcitrack/mcitrack_b224/<seq_id>.txt
+        """
+        # Locate repo root relative to this file's location inside the repo.
+        # This assumes the dataset file lives under: lib/test/evaluation/datasets/...
+
+        results_root = "/content/drive/MyDrive/MCITrack/test/tracking_results/mcitrack/mcitrack_b224"
+
+        seqs = []
+        for seq_id, meta in self.seq_meta.items():
+            result_path = os.path.join(results_root, f"{seq_id}.txt")
+            if os.path.isfile(result_path):
+                continue
+            seqs.append(self._construct_sequence(seq_id, meta))
+
+        return SequenceList(seqs)
+
+    def _construct_sequence(self, seq_id: str, meta: dict):
+        n_frames = int(meta["n_frames"])
+
+        video_path = os.path.join(self.dataset_root, meta["video_path"])
+        if not os.path.isfile(video_path):
+            raise FileNotFoundError(f"Video not found for {seq_id}: {video_path}")
+
+        seq_cache_dir = os.path.join(self.cache_root, seq_id.replace("/", "__"))
+        _decode_video_to_cache(video_path, seq_cache_dir, expected_n_frames=n_frames)
+
+        frames = [os.path.join(seq_cache_dir, f"{i:08d}.jpg") for i in range(n_frames)]
+
+        # Load annotations if provided (train split). For public_lb this is typically null.
+        ann_rel = meta.get("annotation_path", None)
+        ann_path = os.path.join(self.dataset_root, ann_rel) if ann_rel else None
+        gt = _load_annotations_csv_xywh(ann_path, n_frames=n_frames)
+
+        # Critical: tracker init uses gt[0]. If gt[0] is 0,0,0,0 you get "Too small bounding box."
+        init = _first_valid_bbox(gt)
+        if init is not None:
+            # If the first valid bbox occurs later (k>0), copy it to frame 0 so initialization succeeds.
+            gt[0, :] = init
+        else:
+            # No annotations available at all => fallback init from first frame size.
+            gt[0, :] = _default_init_bbox_from_first_frame(frames[0])
+
+        return Sequence(seq_id, frames, "uavpl", gt)
+
+    def __len__(self):
+        return len(self.seq_meta)
