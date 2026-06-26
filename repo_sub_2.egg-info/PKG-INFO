@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: repo-sub-2
+Version: 0.1.0
+Summary: UETrack library
+Requires-Python: >=3.8
